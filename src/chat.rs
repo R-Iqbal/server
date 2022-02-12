@@ -1,28 +1,23 @@
+use std::collections::HashMap;
 use std::error::Error;
-use std::fmt;
 use std::io::prelude::*;
 
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread::{self, JoinHandle};
+use std::thread::{self};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
 use serde::{Deserialize, Serialize};
 
 #[derive(Serialize, Deserialize)]
 struct SocketMessage {
-    r#type: String,
-    data: DataKind,
-}
-#[derive(Serialize, Deserialize)]
-#[serde(untagged)]
-enum DataKind {
-    StringVector(Vec<String>),
+    payload: SocketPayloadKind,
 }
 
-pub enum Event {
+#[derive(Serialize, Deserialize)]
+pub enum SocketPayloadKind {
     Connected { username: String },
-    SetUsername { username: String },
+    SetUsername { user_id: String, username: String },
     Disconnected { username: String },
     CreateRoom { roomId: String },
     JoinRoom { roomId: String },
@@ -40,27 +35,6 @@ impl Commands {
     }
 }
 
-pub struct EventHandler {}
-
-impl EventHandler {
-    pub fn handle_event(event: Event, connected_clients: &Arc<Mutex<Vec<String>>>) {
-        println!("Tiggering the event handler!");
-        match event {
-            Event::Connected { username } => {
-                // Acquire a lock on the mutex guard
-                let mut connected_clients = connected_clients.lock().unwrap();
-                connected_clients.push(username);
-            }
-            Event::Disconnected { username } => todo!(),
-            Event::CreateRoom { roomId } => todo!(),
-            Event::JoinRoom { roomId } => todo!(),
-            Event::SetUsername { username } => {
-                println!("The user is trying to change their name to: {}", username);
-            }
-        }
-    }
-}
-
 struct Message {
     sender: String,
     contents: String,
@@ -72,7 +46,7 @@ pub struct Server {
     port: String,
     listener: TcpListener,
     pub connected_clients: u64,
-    pub clients: Arc<Mutex<Vec<String>>>,
+    pub clients: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl Server {
@@ -84,7 +58,7 @@ impl Server {
 
         let listener = TcpListener::bind(&host).unwrap();
 
-        let clients = Arc::new(Mutex::new(Vec::<String>::new()));
+        let clients = Arc::new(Mutex::new(HashMap::<String, String>::new()));
         Ok(Server {
             host,
             address,
@@ -96,83 +70,75 @@ impl Server {
     }
 
     pub fn connection_handler(
-        mut connected_clients: Arc<Mutex<Vec<String>>>,
+        mut connected_clients: Arc<Mutex<HashMap<String, String>>>,
         mut stream: TcpStream,
         rx: Receiver<String>,
         tx: Sender<String>,
     ) {
-        let mut data = [0 as u8; 50]; // using 50 byte buffer
+        // Create a 200 byte buffer to read in the data from the client
+        let mut data = [0 as u8; 200];
 
-        while match stream.read(&mut data) {
-            Ok(size) => {
-                let data = data[..size].to_vec();
-                let message = String::from_utf8(data).unwrap();
+        // While there is new data to be read from the stream
+        while if let Ok(size) = stream.read(&mut data) {
+            // Check if we have recieved any messages from the main thread
+            // which need to be passed onto this client
+            rx.try_recv().map(|thread_message| {
+                println!("Recieved a message! {}", thread_message);
+            });
 
-                rx.try_recv().map(|thread_message| {
-                    println!("Recieved a message! {}", thread_message);
-                });
+            // Read in the data from the socket
+            let data = data[..size].to_vec();
+            let message = String::from_utf8(data).unwrap();
 
-                if message.len() > 0 {
-                    println!("Recieved a message: {:?}", message);
+            println!("Recieved a message: {}", message);
 
-                    // Begin event handle
+            // Parse the message into a SocketMessage so we can determine
+            // how to handle the execution
+            let message: SocketMessage = serde_json::from_str(&message).unwrap();
 
-                    if message.starts_with(&Commands::SetUsername.value()) {
-                        let username = message.replace("!username", "").trim_start().to_string();
+            // Examine the type of SocketPayload to determine how we should handle
+            // the request
+            match message.payload {
+                SocketPayloadKind::Connected { username } => todo!(),
+                SocketPayloadKind::SetUsername { user_id, username } => {
+                    // Attempt to acquire the lock on the mutex
+                    let mut connected_clients = connected_clients.lock().unwrap();
+                    connected_clients.insert(user_id, username);
 
-                        // Acquire a lock on the mutex guard
-                        let mut connected_clients = connected_clients.lock().unwrap();
-
-                        // Push the new clients onto the list of connected clients
-                        connected_clients.push(username);
-
-                        let socket_message = SocketMessage {
-                            r#type: String::from("array"),
-                            data: DataKind::StringVector(connected_clients.clone()),
-                        };
-
-                        let json = serde_json::to_string(&socket_message).unwrap();
-
-                        let y = serde_json::to_vec(&socket_message).unwrap();
-
-                        stream.write(&y).unwrap();
-                    }
+                    println!("The list of connected users are: {:?}", connected_clients);
                 }
+                SocketPayloadKind::Disconnected { username } => todo!(),
+                SocketPayloadKind::CreateRoom { roomId } => todo!(),
+                SocketPayloadKind::JoinRoom { roomId } => todo!(),
+            }
 
-                true
-            }
-            Err(_) => {
-                stream.shutdown(Shutdown::Both).unwrap();
-                true
-            }
+            true
+        } else {
+            stream.shutdown(Shutdown::Both).unwrap();
+            true
         } {}
     }
 
     pub fn start_listening(&mut self) {
         let (s1, r1) = bounded::<String>(0);
 
+        // For each of the incoming connections create a connection handler
+        // to deal with any requests
         for stream in self.listener.incoming() {
-            match stream {
-                Ok(stream) => {
-                    self.connected_clients += 1;
-                    println!(
-                        "A new client has connected! There are now {} connected clinets",
-                        self.connected_clients
-                    );
+            let stream = stream.unwrap();
 
-                    let clients_arc = Arc::clone(&self.clients);
+            self.connected_clients += 1;
+            println!(
+                "A new client has connected! There are now {} connected clinets",
+                self.connected_clients
+            );
 
-                    let (s2, r2) = (s1.clone(), r1.clone());
-                    let joinHandle = thread::spawn(move || {
-                        Self::connection_handler(clients_arc, stream, r2, s2);
-                    });
+            let clients_arc = Arc::clone(&self.clients);
 
-                    s1.send(String::from("Hello!")).unwrap();
-                }
-                Err(e) => {
-                    panic!("Uh oh!")
-                }
-            }
+            let (s2, r2) = (s1.clone(), r1.clone());
+            thread::spawn(move || {
+                Self::connection_handler(clients_arc, stream, r2, s2);
+            });
         }
     }
 }
