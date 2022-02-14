@@ -4,9 +4,9 @@ use std::io::prelude::*;
 
 use std::net::{Shutdown, TcpListener, TcpStream};
 use std::sync::{Arc, Mutex};
-use std::thread::{self};
 
 use crossbeam_channel::{bounded, Receiver, Sender};
+use crossbeam_utils::thread;
 use serde::{Deserialize, Serialize};
 use serde_json::{Deserializer, Value};
 
@@ -22,7 +22,13 @@ pub struct Message {
 }
 
 #[derive(Serialize, Deserialize, Debug)]
+enum MessageEnumerator {
+    SocketMessage(SocketMessage),
+    Message(Message),
+}
+#[derive(Serialize, Deserialize, Debug)]
 pub enum SocketPayloadKind {
+    Ack,
     Connected {
         username: String,
     },
@@ -116,87 +122,94 @@ impl Server {
         rx: Receiver<String>,
         tx: Sender<String>,
     ) {
-        // Attempt to deserialize the incoming data from the stream
-        let values = Deserializer::from_reader(&stream).into_iter::<Value>();
+        thread::scope(|s| {
+            // Attempt to deserialize the incoming data from the stream
+            let values = Deserializer::from_reader(&stream).into_iter::<Value>();
 
-        for value in values {
-            let value = value.unwrap();
+            s.spawn(|s| {
+                s.spawn(|_| {
+                    // Collect all the messages from the channel
+                    // Block until the sender has been dropped
+                    rx.iter().for_each(|broadcast_message| {
+                        // Try to parse the actual type from the message
+                        let serialized_message: Message =
+                            serde_json::from_str(&broadcast_message).unwrap();
 
-            if !rx.is_empty() {
-                let main_thread_message = rx.try_recv().unwrap();
+                        let serialized = &serde_json::to_vec(&serialized_message).unwrap();
 
-                println!(
-                    "Recieved a message from main thread! {}",
-                    main_thread_message
-                );
+                        (&stream).write_all(&serialized).unwrap();
+                    });
+                });
+            });
+
+            for value in values {
+                let value = value.unwrap();
+
+                // Parse the message into a SocketMessage so we can determine
+                // how to handle the execution
+                let message: SocketMessage = serde_json::from_value(value).unwrap();
+
+                // Examine the type of SocketPayload to determine how we should handle
+                // the request
+                match message.payload {
+                    SocketPayloadKind::Connected { username } => todo!(),
+                    SocketPayloadKind::SetUsername { user_id, username } => {
+                        // Attempt to acquire the lock on the mutex
+                        let mut connected_clients = connected_clients.lock().unwrap();
+                        connected_clients.insert(user_id, username);
+                    }
+                    SocketPayloadKind::Disconnected { username } => todo!(),
+                    SocketPayloadKind::CreateRoom { roomId } => todo!(),
+                    SocketPayloadKind::JoinRoom { userId, roomId } => {
+                        // Attempt to acquire the lock on the mutex
+                        let mut rooms = rooms.lock().unwrap();
+
+                        // Fetch the room to update the participants
+                        let room = rooms.get_mut(&roomId).unwrap();
+                        room.participants.push(userId);
+                    }
+                    SocketPayloadKind::ListRooms => {
+                        // Attempt to acquire the lock on the mutex
+                        let mut rooms = rooms.lock().unwrap();
+
+                        // Return the list of room identifiers back to the client
+                        let room_ids = rooms.keys().cloned().collect();
+
+                        let message = SocketMessage {
+                            payload: SocketPayloadKind::Rooms { rooms: room_ids },
+                        };
+
+                        let serialzed = &serde_json::to_vec(&message).unwrap();
+
+                        (&stream).write_all(&serialzed).unwrap();
+                    }
+                    SocketPayloadKind::Rooms { rooms } => todo!(),
+                    SocketPayloadKind::Message {
+                        userId,
+                        roomId,
+                        message,
+                    } => {
+                        // Attempt to acquire the lock on the mutex
+                        let mut rooms = rooms.lock().unwrap();
+
+                        // Fetch the room
+                        let room = rooms.get_mut(&roomId).unwrap();
+
+                        let message = Message {
+                            user_id: userId,
+                            message,
+                        };
+
+                        tx.send(serde_json::to_string(&message).unwrap()).unwrap();
+
+                        // Add the message to the room
+                        room.messages.push(message);
+                    }
+                    SocketPayloadKind::Ack => todo!(),
+                }
             }
-
-            // Parse the message into a SocketMessage so we can determine
-            // how to handle the execution
-            let message: SocketMessage = serde_json::from_value(value).unwrap();
-
-            println!("Message is: {:?}", message);
-
-            // Examine the type of SocketPayload to determine how we should handle
-            // the request
-            match message.payload {
-                SocketPayloadKind::Connected { username } => todo!(),
-                SocketPayloadKind::SetUsername { user_id, username } => {
-                    // Attempt to acquire the lock on the mutex
-                    let mut connected_clients = connected_clients.lock().unwrap();
-                    connected_clients.insert(user_id, username);
-
-                    println!("The list of connected users are: {:?}", connected_clients);
-                }
-                SocketPayloadKind::Disconnected { username } => todo!(),
-                SocketPayloadKind::CreateRoom { roomId } => todo!(),
-                SocketPayloadKind::JoinRoom { userId, roomId } => {
-                    // Attempt to acquire the lock on the mutex
-                    let mut rooms = rooms.lock().unwrap();
-
-                    // Fetch the room to update the participants
-                    let room = rooms.get_mut(&roomId).unwrap();
-                    room.participants.push(userId);
-                }
-                SocketPayloadKind::ListRooms => {
-                    // Attempt to acquire the lock on the mutex
-                    let mut rooms = rooms.lock().unwrap();
-
-                    // Return the list of room identifiers back to the client
-                    let room_ids = rooms.keys().cloned().collect();
-
-                    let message = SocketMessage {
-                        payload: SocketPayloadKind::Rooms { rooms: room_ids },
-                    };
-
-                    let serialzed = &serde_json::to_vec(&message).unwrap();
-
-                    (&stream).write_all(&serialzed).unwrap();
-                }
-                SocketPayloadKind::Rooms { rooms } => todo!(),
-                SocketPayloadKind::Message {
-                    userId,
-                    roomId,
-                    message,
-                } => {
-                    // Attempt to acquire the lock on the mutex
-                    let mut rooms = rooms.lock().unwrap();
-
-                    // Fetch the room
-                    let room = rooms.get_mut(&roomId).unwrap();
-
-                    let message = Message {
-                        user_id: userId,
-                        message: message,
-                    };
-
-                    tx.send(serde_json::to_string(&message).unwrap()).unwrap();
-
-                    // Add the message to the room
-                    room.messages.push(message);
-                }
-            }
-        }
+        })
+        .unwrap();
     }
 
     pub fn start_listening(&mut self) {
@@ -205,7 +218,6 @@ impl Server {
         // For each of the incoming connections create a connection handler
         // to deal with any requests
 
-        s1.try_send(String::from("Hello!")).unwrap();
         for stream in self.listener.incoming() {
             let stream = stream.unwrap();
 
@@ -219,9 +231,8 @@ impl Server {
             let rooms_arc = Arc::clone(&self.rooms);
 
             let (s2, r2) = (s1.clone(), r1.clone());
-            thread::spawn(move || {
-                Self::connection_handler(clients_arc, rooms_arc, stream, r2, s2);
-            });
+
+            Self::connection_handler(clients_arc, rooms_arc, stream, r2, s2);
         }
     }
 }
